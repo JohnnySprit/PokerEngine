@@ -1,3 +1,9 @@
+# mcequity.py
+# heads-up monte carlo:
+# - estimate_hu_equity(): deal random villain hole cards + finish the board, compare hands and keep track of wins, losses, and ties
+# - pot odds helpers for "should I call" type decisions
+# pokerkit state stuff lives in pokerengine.py, not here
+
 import random
 
 from pokerkit import StandardHighHand

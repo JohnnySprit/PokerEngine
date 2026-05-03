@@ -1,6 +1,17 @@
+# pokerengine.py
+# - builds a PokerKit heads-up no limit holdem table state
+# - runs one hand all the way to the end (deal/burn/board/betting) in play_hand_live()
+# - how the bot works with the two algorithms:
+#     mc_policy gets monte carlo equity + a little bluff rng
+#     expectiminimax_min_policy gets tiny expectiminimax picker (real logic is in expectiminimax_min.py)
+# run: python pokerengine.py  (plays one MC hand and prints logs)
+
+import random
+
 from pokerkit import Automation, NoLimitTexasHoldem
 from pokerkit.state import State
 
+from expectiminimax_min import decide_expectiminimax_min
 from mcequity import decide_with_mc, estimate_hu_equity
 
 #these are kinda the boilerplate automations that pokerkit has, we might not use all of them but its good to just have
@@ -28,57 +39,177 @@ def create_hunl_state(stacks: tuple[int, int] = (500, 500), small_blind: int = 1
     )
 
 
-def bot_act_mc(state: State, bot_index: int = 0, trials: int = 8000) -> str:
+# --- Monte Carlo bot tuning (MC policy) -------------------------------------
 
-    hero = tuple(state.hole_cards[bot_index]) #the bot's hole cards
-    board = tuple(state.get_board_cards(0)) #gets the board gardss
+MC_RAISE_EQ = 0.70
+MC_BET_TO_CHIPS = 20
+MC_RAISE_BY_CHIPS = 20
 
-    bets = list[int](state.bets) # list of bets in front of each player (0 and 1)
-    to_call = max(bets) - bets[bot_index] # difference between max bet and bot's bet (so would be 0 if bot has put up the max bet)
-    max_bet = max(bets) # max bet on the table (helps know how much to raise to)
-    stack = int(state.stacks[bot_index]) # how many chips the bot has left in their stack
+# simple mixed-strategy bluffing and occasionally does a bet/raise in a marginal equity band.
+MC_BLUFF_P = 0.18
+MC_BLUFF_EQ_LOW = 0.33
+MC_BLUFF_EQ_HIGH = 0.45
+
+# expectiminimax-min raise sizing (must match `expectiminimax_min.decide_expectiminimax_min` default unless changed here).
+EXPECTIMINIMAX_MIN_RAISE_BY_CHIPS = 20.0
+
+# added a small speed optimization here for the monte carlo trials
+def adaptive_trials_for_street(board_len: int, base_trials: int) -> int:
+    # cheap speed hack fewer MC trials early, crank it up as more board cards appear
+    # board_len is 0 preflop, 3 flop, 4 turn, 5 river
+    if board_len <= 0:
+        return max(200, int(base_trials * 0.25))
+    if board_len == 3:
+        return max(400, int(base_trials * 0.50))
+    if board_len == 4:
+        return max(600, int(base_trials * 0.80))
+    return max(800, int(base_trials * 1.10))
 
 
-    #CHANGE THESE VALUES IF WANT TO CHANGE THE BOT'S RAISE BEHAVIOR/AGGRESSION
-    RAISE_EQ = 0.70 #just saying how much equity is required by monte carlo to raise
+def mc_policy(state: State, bot_index: int = 0, trials: int = 8000) -> str:
+    # main bot for demos does sample equity on random villain cards/runouts (monte carlo equity), then act on it
+    # when nobody bet into us, we intentionally don't run the pot-odds call helper (that's for facing a bet only, not for checking)
 
-    # BET_TO and RAISE_BY only happens RAISE_EQ is met and stack is greater than 0
-    BET_TO = 20 #bets 20 if to_call is 0 (villain bot does a check)
-    RAISE_BY = 20 #raise by 20 when to_call is greater than 0 (villain bot does a bet)
+    hero = tuple(state.hole_cards[bot_index])
+    board = tuple(state.get_board_cards(0))
+    street_trials = adaptive_trials_for_street(len(board), trials)
 
+    bets = list[int](state.bets)
+    to_call = max(bets) - bets[bot_index]
+    max_bet = max(bets)
+    stack = int(state.stacks[bot_index])
 
-    wins, losses, ties, eq = estimate_hu_equity(hero, board, trials=trials, seed=None) #estimate_hu_equity is imported in from mcequity.py
+    wins, losses, ties, eq = estimate_hu_equity(hero, board, trials=street_trials, seed=None)
 
     # When facing no bet (to_call == 0): either value-bet or check. Do not use call/fold MC here.
+    # if we have enough equity to call, then we can bluff
     if to_call <= 0:
-        #starts the street off with a bet if equity is high enough
-        if eq >= RAISE_EQ and stack > 0 and state.can_complete_bet_or_raise_to(): #if we have high enough equity to raise, as well as having the chips and approval from pokerkit, then we bet to BET_TO
-            bet_to = min(stack, BET_TO) #go all in if we have enough chips to cover the bet
-            state.complete_bet_or_raise_to(bet_to) #pokerkit function handles the bet
-            return f"BET_TO {bet_to} eq={eq:.2f} need=0.00"
-        state.check_or_call() #if we don't have high enough equity to raise, then we just check
-        return f"CHECK eq={eq:.2f} need=0.00"
+        if (
+            (MC_BLUFF_EQ_LOW <= eq <= MC_BLUFF_EQ_HIGH)
+            and (random.random() < MC_BLUFF_P)
+            and stack > 0
+            and state.can_complete_bet_or_raise_to()
+        ):
+            bet_to = min(stack, MC_BET_TO_CHIPS)
+            try:
+                state.complete_bet_or_raise_to(bet_to)
+                return f"BLUFF_BET_TO {bet_to} eq={eq:.2f} trials={street_trials}"
+            except ValueError:
+                state.complete_bet_or_raise_to()
+                return f"BLUFF_BET_MIN eq={eq:.2f} trials={street_trials}"
 
+        if eq >= MC_RAISE_EQ and stack > 0 and state.can_complete_bet_or_raise_to():
+            bet_to = min(stack, MC_BET_TO_CHIPS)
+            try:
+                state.complete_bet_or_raise_to(bet_to)
+                return f"BET_TO {bet_to} eq={eq:.2f} trials={street_trials}"
+            except ValueError:
+                state.complete_bet_or_raise_to()
+                return f"BET_MIN eq={eq:.2f} trials={street_trials}"
+        state.check_or_call()
+        return f"CHECK eq={eq:.2f} trials={street_trials}"
 
-    # this block only matters if the villain bot does a bet (like when to_call is greater than 0)
+    r = decide_with_mc(
+        hero,
+        board,
+        pot_chips=float(state.total_pot_amount),
+        to_call=float(to_call),
+        trials=street_trials,
+        seed=None,
+    )
 
-    r = decide_with_mc(hero, board, pot_chips=float(state.total_pot_amount), to_call=float(to_call), trials=trials, seed=None) #calls decide_with_mc which is imported in from mcequity.py
-    if r["action"] == "FOLD":
+    if r["action"] == "FOLD": # if we dont have enough equity to call, then fold
         state.fold()
-        return f"FOLD eq={r['equity']:.2f} need={r['breakeven_equity']:.2f}"
+        return f"FOLD eq={r['equity']:.2f} need={r['breakeven_equity']:.2f} trials={street_trials}"
 
-    #if fold doesnt happen, then we see if we can raise
-    # basically if the bot has enough equity to raise, raise to RAISE_BY (which is 6)
-    if r["equity"] >= RAISE_EQ and stack > 0: #same idea as above here
-        if state.can_complete_bet_or_raise_to(): #asks pokerkit if legal
-            raise_to = max_bet + min(stack, RAISE_BY) #looks at how much the max bet currently is and then raises
-            state.complete_bet_or_raise_to(raise_to) #pokerkit function handles the bet or raise to the amount of raise_to
-            return f"RAISE_TO {int(raise_to)} eq={r['equity']:.2f} need={r['breakeven_equity']:.2f}"
-    else:
-        state.check_or_call() # does a regular check orcall if equity is not high enough to raise
-        return f"CALL eq={r['equity']:.2f} need={r['breakeven_equity']:.2f}"
+    # if we are in the marginal equity band, then we can bluff
+    if (
+        (MC_BLUFF_EQ_LOW <= float(r["equity"]) <= MC_BLUFF_EQ_HIGH)
+        and (random.random() < MC_BLUFF_P)
+        and stack > 0
+        and state.can_complete_bet_or_raise_to()
+    ):
+        raise_to = max_bet + min(stack, MC_RAISE_BY_CHIPS)
+        try:
+            state.complete_bet_or_raise_to(raise_to)
+            return f"BLUFF_RAISE_TO {int(raise_to)} eq={float(r['equity']):.2f} need={r['breakeven_equity']:.2f} trials={street_trials}"
+        except ValueError:
+            state.complete_bet_or_raise_to()
+            return f"BLUFF_RAISE_MIN eq={float(r['equity']):.2f} need={r['breakeven_equity']:.2f} trials={street_trials}"
 
-# SUPER SIMPLE VILLAIN THAT JUST CHECKS OR CALLS
+    # if we have enough equity to raise, then check if we can legally raise
+    if r["equity"] >= MC_RAISE_EQ and stack > 0:
+        if state.can_complete_bet_or_raise_to():
+            raise_to = max_bet + min(stack, MC_RAISE_BY_CHIPS)
+            try:
+                state.complete_bet_or_raise_to(raise_to)
+                return f"RAISE_TO {int(raise_to)} eq={r['equity']:.2f} need={r['breakeven_equity']:.2f} trials={street_trials}"
+            except ValueError:
+                state.complete_bet_or_raise_to() # if we can't legally raise, then just do the min legal raise
+                return f"RAISE_MIN eq={r['equity']:.2f} need={r['breakeven_equity']:.2f} trials={street_trials}"
+
+    # if all else fails, then just check or call
+    state.check_or_call()
+    return f"CALL eq={r['equity']:.2f} need={r['breakeven_equity']:.2f} trials={street_trials}"
+
+
+def expectiminimax_min_policy(state: State, bot_index: int = 0, trials: int = 1500) -> str:
+    # read numbers out of PokerKit, call decide_expectiminimax_min(), then apply the chosen PokerKit action
+    # the search is only 1 ply and the EV model is simplified
+
+    hero = tuple(state.hole_cards[bot_index])
+    board = tuple(state.get_board_cards(0))
+
+    bets = list[int](state.bets)
+    to_call = float(max(bets) - bets[bot_index])
+    max_bet = float(max(bets))
+    stack = float(int(state.stacks[bot_index]))
+    can_raise = bool(state.can_complete_bet_or_raise_to())
+
+    # decide the action using the expectiminimax_min algorithm
+    r = decide_expectiminimax_min(
+        hero,
+        board,
+        pot_chips=float(state.total_pot_amount),
+        to_call=to_call,
+        max_bet=max_bet,
+        stack=stack,
+        can_raise=can_raise,
+        trials=trials,
+        raise_by=EXPECTIMINIMAX_MIN_RAISE_BY_CHIPS,
+    )
+
+    # apply the chosen PokerKit action
+    action = str(r["action"])
+    amount = int(float(r["amount"]))
+    eq = float(r["equity"])
+    ev = float(r["best_ev"])
+    evs = r.get("action_values", {})
+    ev_parts: list[str] = []
+    if isinstance(evs, dict):
+        for k in ("FOLD", "CALL", "CHECK", "RAISE"):
+            if k in evs:
+                ev_parts.append(f"{k}={float(evs[k]):.1f}")
+    evs_str = (" evs[" + ",".join(ev_parts) + "]") if ev_parts else ""
+
+
+    if action == "FOLD" and to_call > 0:
+        state.fold()
+        return f"FOLD eq={eq:.2f} ev={ev:.2f}{evs_str}"
+
+    if action == "RAISE" and can_raise and amount > 0:
+        state.complete_bet_or_raise_to(amount)
+        if to_call > 0:
+            return f"RAISE_TO {amount} eq={eq:.2f} ev={ev:.2f}{evs_str}"
+        return f"BET_TO {amount} eq={eq:.2f} ev={ev:.2f}{evs_str}"
+
+    state.check_or_call()
+    if to_call > 0:
+        return f"CALL eq={eq:.2f} ev={ev:.2f}{evs_str}"
+    return f"CHECK eq={eq:.2f} ev={ev:.2f}{evs_str}"
+
+
+# SUPER SIMPLE VILLAIN THAT JUST CHECKS OR CALLS, want to reach showdowns with villain so we can evaluate the bot
 def villain_act(state: State, villain_index: int = 1) -> str:
 
     bets = list[int](state.bets) #list of bets in front of each player (0 and 1)
@@ -95,7 +226,13 @@ def villain_act(state: State, villain_index: int = 1) -> str:
     return "CHECK"
 
 
-def play_hand_live(state: State, bot_index: int = 0, trials: int = 8000, silent: bool = False) -> list[str]:
+def play_hand_live(
+    state: State,
+    bot_index: int = 0,
+    trials: int = 8000,
+    silent: bool = False,
+    bot_policy: str = "mc",
+) -> list[str]:
     actions = [] #list that keeps track of each player action
     last_board_len = 0 #keeps track of how many cards are currently on the board, so we know if we need to update
     printed_bot_hand = False
@@ -132,7 +269,10 @@ def play_hand_live(state: State, bot_index: int = 0, trials: int = 8000, silent:
                 last_board_len = len(board) #updates length so we can compare again later
                 actions.append(f"BOARD {str(board)}")
         elif state.turn_index == bot_index: #if its the bot's turn, then pokerkit deems it legal for it to act
-            a = bot_act_mc(state, bot_index=bot_index, trials=trials) #calls bot_act_mc which helps it make decisions. the # of trials is how many times it runs the monte carlo simulation
+            if bot_policy == "expectiminimax_min":
+                a = expectiminimax_min_policy(state, bot_index=bot_index, trials=trials)
+            else:
+                a = mc_policy(state, bot_index=bot_index, trials=trials)
             actions.append(f"P{bot_index}(BOT) {a}") #logs the action the bot took
         else:
             a = villain_act(state, villain_index=1) #calls villain_act
@@ -151,7 +291,10 @@ def main() -> None:
 
     numtrials = 2000
     state = create_hunl_state() #this is the actual pokerkit state that is tracking everything
-    actions = play_hand_live(state, bot_index=0, trials=numtrials) #this is the actual loop moving the state forward until the game is over
+
+    #chance policy to "mc" to use the monte carlo policy
+    #change policy here to "expectiminimax_min" to use the expectiminimax_min policy
+    actions = play_hand_live(state, bot_index=0, trials=numtrials, bot_policy="expectiminimax_min") #this is the actual loop moving the state forward until the game is over, change bot_policy to "expectiminimax_min" to use the expectiminimax_min policy
 
     print("\n")
     print("Hand over:", not state.status) #state.status is False when the hand is over, so its a little backwards but makes sense

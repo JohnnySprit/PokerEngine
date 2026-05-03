@@ -1,12 +1,14 @@
-import random
+# opencfr_demo.py
+# small CFR demo here: we call openCFR's sample game + MCCFR external sampling trainer
+# run: python opencfr_demo.py
+
 import openCFR.minimizers.MCCFR_External as MCCFR_External
 from openCFR.Trainer import Trainer
 from openCFR.games.sample_games import TexasHoldEm
 
 
-# CHANGE THESE VALUES TO CHANGE THE TRAINING SETTINGS
+# knobs for the bundled toy game inside openCFR (stacks/blinds are tiny on purpose)
 TRAIN_ITERS = 800
-SEED = random.randint(0, 1000000)
 SB = 1
 BB = 2
 STACK = 8
@@ -25,7 +27,7 @@ STACK = 8
 #this moves the bot towards the nash equilibrum which basically just means the bot will play the best it can given the other player's actions.
 
 
-def main():
+def main() -> None:
     game = TexasHoldEm(small_blind=SB, big_blind=BB, starting_stack=STACK)
     trainer = Trainer(game=game, minimizer=MCCFR_External)
     infosets, expected_game_value = trainer.train(iterations=TRAIN_ITERS, display_results=False, save_results=False)
